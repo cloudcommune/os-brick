@@ -43,6 +43,7 @@ class RBDConnector(base.BaseLinuxConnector):
                                            device_scan_attempts,
                                            *args, **kwargs)
         self.do_local_attach = kwargs.get('do_local_attach', False)
+        self.ceph_conf_created = False
 
     @staticmethod
     def get_connector_properties(root_helper, *args, **kwargs):
@@ -90,13 +91,15 @@ class RBDConnector(base.BaseLinuxConnector):
                     zip(self._sanitize_mon_hosts(monitor_ips), monitor_ports)]
         mon_hosts = "mon_host = %s" % (','.join(monitors))
 
+        client_section = "[client.%s]" % user
         keyring = self._check_or_get_keyring_contents(keyring, cluster_name,
                                                       user)
 
         try:
             fd, ceph_conf_path = tempfile.mkstemp(prefix="brickrbd_")
             with os.fdopen(fd, 'w') as conf_file:
-                conf_file.writelines([mon_hosts, "\n", keyring, "\n"])
+                conf_file.writelines([mon_hosts, "\n",
+                                      client_section, "\n", keyring, "\n"])
             return ceph_conf_path
         except IOError:
             msg = (_("Failed to write data to %s.") % (ceph_conf_path))
@@ -114,18 +117,29 @@ class RBDConnector(base.BaseLinuxConnector):
             msg = _("Connect volume failed, malformed connection properties.")
             raise exception.BrickException(msg=msg)
 
-        conf = self._create_ceph_conf(monitor_ips, monitor_ports,
-                                      str(cluster_name), user,
-                                      keyring)
+        conf = connection_properties.get('conffile')
+        if (not conf) or (not os.path.isfile(conf)):
+            LOG.debug('get conffile is none, try create ceph conf')
+            conf = self._create_ceph_conf(monitor_ips, monitor_ports,
+                                          str(cluster_name), user, keyring)
+            self.ceph_conf_created = True
+        else:
+            LOG.debug('use conffile=%s', conf)
+
+        LOG.debug('user=%s, pool=%s, cluster_name=%s, volume=%s, conf=%s',
+                  user, pool, cluster_name, volume, conf)
+
         try:
             rbd_client = linuxrbd.RBDClient(user, pool, conffile=conf,
                                             rbd_cluster_name=str(cluster_name))
             rbd_volume = linuxrbd.RBDVolume(rbd_client, volume)
             rbd_handle = linuxrbd.RBDVolumeIOWrapper(
                 linuxrbd.RBDImageMetadata(rbd_volume, pool, user, conf))
-        except Exception:
-            fileutils.delete_if_exists(conf)
-            raise
+        finally:
+            if self.ceph_conf_created:
+                LOG.debug("delete conf=%s", conf)
+                fileutils.delete_if_exists(conf)
+                self.ceph_conf_created = False
 
         return rbd_handle
 
@@ -227,7 +241,8 @@ class RBDConnector(base.BaseLinuxConnector):
             if device_info:
                 rbd_handle = device_info.get('path', None)
                 if rbd_handle is not None:
-                    fileutils.delete_if_exists(rbd_handle.rbd_conf)
+                    if ("tmp" == rbd_handle.rbd_conf.split("/")[1]):
+                        fileutils.delete_if_exists(rbd_handle.rbd_conf)
                     rbd_handle.close()
 
     def check_valid_device(self, path, run_as_root=True):
